@@ -25,6 +25,9 @@ EMBEDDING_DIMENSION = 3072 # Dimensions for text-embedding-3-large
 CHUNK_SIZE = 1000  # Target size of each chunk in tokens
 CHUNK_OVERLAP = 100 # How many tokens to overlap between chunks
 
+# Pinecone metadata configuration
+MAX_METADATA_CONTENT_LENGTH = 35000  # Conservative limit to stay under 40KB metadata limit
+
 # --- Argument Parsing ---
 def parse_arguments():
     """Parses command-line arguments."""
@@ -164,7 +167,18 @@ def main():
             for i, chunk in enumerate(text_chunks):
                 if i < len(embeddings):
                     vector_id = str(uuid.uuid4())
-                    metadata = {'content': chunk, 'source': filename}
+                    # Truncate content to stay within Pinecone's 40KB metadata limit
+                    # Reserve space for other metadata fields and JSON overhead
+                    truncated_content = chunk[:MAX_METADATA_CONTENT_LENGTH]
+                    if len(chunk) > MAX_METADATA_CONTENT_LENGTH:
+                        truncated_content += "..."
+                    
+                    metadata = {
+                        'content': truncated_content, 
+                        'source': filename,
+                        'chunk_index': i,
+                        'original_length': len(chunk)
+                    }
                     vectors_to_upsert.append({
                         "id": vector_id,
                         "values": embeddings[i],
