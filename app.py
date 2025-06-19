@@ -135,18 +135,22 @@ def get_embeddings(texts: list[str], client: OpenAI, tokenizer, model: str = EMB
     # Process in smaller batches to stay under the 300k token limit
     current_batch = []
     current_token_count = 0
-    max_tokens_per_batch = 250000  # Conservative limit under 300k
+    max_tokens_per_batch = 200000  # More conservative limit (was 250k)
+    batch_count = 0
     
-    for text in texts:
+    for i, text in enumerate(texts):
         text_tokens = len(tokenizer.encode(text))
         
         # If adding this text would exceed the limit, process current batch
         if current_token_count + text_tokens > max_tokens_per_batch and current_batch:
+            batch_count += 1
+            print(f"    📦 Processing batch {batch_count} with {len(current_batch)} chunks ({current_token_count:,} tokens)")
             try:
                 response = client.embeddings.create(input=current_batch, model=model)
                 all_embeddings.extend([item.embedding for item in response.data])
             except Exception as e:
-                print(f"  └── ❌ Error generating embeddings for batch: {e}")
+                print(f"  └── ❌ Error generating embeddings for batch {batch_count}: {e}")
+                print(f"      Batch had {len(current_batch)} chunks with {current_token_count:,} tokens")
                 return []
             
             # Start new batch
@@ -158,11 +162,14 @@ def get_embeddings(texts: list[str], client: OpenAI, tokenizer, model: str = EMB
     
     # Process the final batch
     if current_batch:
+        batch_count += 1
+        print(f"    📦 Processing final batch {batch_count} with {len(current_batch)} chunks ({current_token_count:,} tokens)")
         try:
             response = client.embeddings.create(input=current_batch, model=model)
             all_embeddings.extend([item.embedding for item in response.data])
         except Exception as e:
-            print(f"  └── ❌ Error generating embeddings for final batch: {e}")
+            print(f"  └── ❌ Error generating embeddings for final batch {batch_count}: {e}")
+            print(f"      Batch had {len(current_batch)} chunks with {current_token_count:,} tokens")
             return []
     
     return all_embeddings
@@ -240,6 +247,8 @@ def main():
                 continue
 
             # 3. Generate embeddings
+            total_tokens = sum(len(tokenizer.encode(chunk)) for chunk in text_chunks)
+            print(f"  📄 {len(text_chunks)} chunks, {total_tokens:,} total tokens")
             embeddings = get_embeddings(text_chunks, openai_client, tokenizer)
             if not embeddings:
                 pbar.update(1)
