@@ -1,0 +1,6 @@
+openai
+pinecone
+python-dotenv
+pypdf
+tiktoken
+tqdm 
