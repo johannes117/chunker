@@ -1,5 +1,7 @@
 import os
 import argparse
+import json
+from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
 from pinecone import Pinecone
@@ -34,7 +36,38 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Process PDFs and upload to Pinecone.")
     parser.add_argument("--index_name", type=str, required=True, help="Name of the Pinecone index.")
     parser.add_argument("--pdf_folder", type=str, required=True, help="Path to the folder containing PDF files.")
+    parser.add_argument("--resume", action="store_true", help="Resume from previous state file.")
+    parser.add_argument("--state_file", type=str, default="processing_state.json", help="Path to state file for resume functionality.")
     return parser.parse_args()
+
+# --- State Management Functions ---
+def load_state(state_file: str) -> dict:
+    """Load processing state from JSON file."""
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️  Warning: Could not load state file {state_file}: {e}")
+    return {"processed_files": [], "total_chunks": 0, "started_at": None}
+
+def save_state(state_file: str, state: dict):
+    """Save processing state to JSON file."""
+    try:
+        with open(state_file, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"⚠️  Warning: Could not save state file {state_file}: {e}")
+
+def update_state(state: dict, filename: str, chunks_added: int):
+    """Update state with processed file."""
+    state["processed_files"].append({
+        "filename": filename,
+        "processed_at": datetime.now().isoformat(),
+        "chunks_added": chunks_added
+    })
+    state["total_chunks"] += chunks_added
+    return state
 
 # --- Core Functions ---
 def get_pdf_text(file_path: str) -> str:
@@ -94,15 +127,45 @@ def chunk_text_with_tokens(text: str, tokenizer) -> list[str]:
 
     return final_chunks
 
-def get_embeddings(texts: list[str], client: OpenAI, model: str = EMBEDDING_MODEL) -> list[list[float]]:
-    """Generates embeddings for a list of text chunks."""
+def get_embeddings(texts: list[str], client: OpenAI, tokenizer, model: str = EMBEDDING_MODEL) -> list[list[float]]:
+    """Generates embeddings for a list of text chunks, processing in batches to avoid token limits."""
     texts = [t.replace("\n", " ") for t in texts]
-    try:
-        response = client.embeddings.create(input=texts, model=model)
-        return [item.embedding for item in response.data]
-    except Exception as e:
-        print(f"  └── ❌ Error generating embeddings: {e}")
-        return []
+    all_embeddings = []
+    
+    # Process in smaller batches to stay under the 300k token limit
+    current_batch = []
+    current_token_count = 0
+    max_tokens_per_batch = 250000  # Conservative limit under 300k
+    
+    for text in texts:
+        text_tokens = len(tokenizer.encode(text))
+        
+        # If adding this text would exceed the limit, process current batch
+        if current_token_count + text_tokens > max_tokens_per_batch and current_batch:
+            try:
+                response = client.embeddings.create(input=current_batch, model=model)
+                all_embeddings.extend([item.embedding for item in response.data])
+            except Exception as e:
+                print(f"  └── ❌ Error generating embeddings for batch: {e}")
+                return []
+            
+            # Start new batch
+            current_batch = [text]
+            current_token_count = text_tokens
+        else:
+            current_batch.append(text)
+            current_token_count += text_tokens
+    
+    # Process the final batch
+    if current_batch:
+        try:
+            response = client.embeddings.create(input=current_batch, model=model)
+            all_embeddings.extend([item.embedding for item in response.data])
+        except Exception as e:
+            print(f"  └── ❌ Error generating embeddings for final batch: {e}")
+            return []
+    
+    return all_embeddings
 
 def main():
     """Main function to run the indexing pipeline."""
@@ -129,15 +192,35 @@ def main():
     index = pinecone_client.Index(args.index_name)
     tokenizer = tiktoken.get_encoding("cl100k_base") # Tokenizer for text-embedding models
 
+    # --- State Management ---
+    state = load_state(args.state_file)
+    if not state["started_at"]:
+        state["started_at"] = datetime.now().isoformat()
+    
+    processed_filenames = [item["filename"] for item in state["processed_files"]]
+    
     # --- File Processing ---
     pdf_files = [f for f in os.listdir(args.pdf_folder) if f.lower().endswith('.pdf')]
     
     if not pdf_files:
         print(f"No PDF files found in '{args.pdf_folder}'.")
         return
+    
+    # Filter out already processed files if resuming
+    if args.resume and processed_filenames:
+        remaining_files = [f for f in pdf_files if f not in processed_filenames]
+        print(f"📁 Found {len(pdf_files)} total PDF files")
+        print(f"✅ Already processed: {len(processed_filenames)} files")
+        print(f"⏳ Remaining to process: {len(remaining_files)} files")
+        pdf_files = remaining_files
+    else:
+        print(f"Found {len(pdf_files)} PDF files to process. Starting fresh...")
+    
+    if not pdf_files:
+        print("🎉 All files already processed!")
+        return
         
-    total_chunks_created = 0
-    print(f"Found {len(pdf_files)} PDF files to process. Starting ingestion...")
+    total_chunks_created = state["total_chunks"]
 
     with tqdm(total=len(pdf_files), desc="Processing PDFs") as pbar:
         for filename in pdf_files:
@@ -157,7 +240,7 @@ def main():
                 continue
 
             # 3. Generate embeddings
-            embeddings = get_embeddings(text_chunks, openai_client)
+            embeddings = get_embeddings(text_chunks, openai_client, tokenizer)
             if not embeddings:
                 pbar.update(1)
                 continue
@@ -186,6 +269,7 @@ def main():
                     })
             
             # 5. Upsert to Pinecone in batches
+            chunks_added = 0
             if vectors_to_upsert:
                 try:
                     # Upsert in smaller batches if necessary
@@ -193,14 +277,26 @@ def main():
                     for j in range(0, len(vectors_to_upsert), batch_size):
                         batch = vectors_to_upsert[j:j + batch_size]
                         index.upsert(vectors=batch)
-                    total_chunks_created += len(vectors_to_upsert)
+                    chunks_added = len(vectors_to_upsert)
+                    total_chunks_created += chunks_added
+                    
+                    # Update and save state after successful processing
+                    state = update_state(state, filename, chunks_added)
+                    save_state(args.state_file, state)
+                    
                 except Exception as e:
                     print(f"  └── ❌ Error upserting to Pinecone for {filename}: {e}")
             
             pbar.update(1)
 
-    print(f"\n✅ Finished processing all {len(pdf_files)} PDF files.")
-    print(f"Total chunks created: {total_chunks_created}")
+    # Calculate session stats
+    initial_chunks = state["total_chunks"] - sum(item["chunks_added"] for item in state["processed_files"])
+    session_chunks = total_chunks_created - initial_chunks
+    
+    print(f"\n✅ Finished processing {len(pdf_files)} PDF files.")
+    print(f"Chunks created this session: {session_chunks}")
+    print(f"Total chunks in index: {total_chunks_created}")
+    print(f"📊 State saved to: {args.state_file}")
 
 if __name__ == "__main__":
     main() 
