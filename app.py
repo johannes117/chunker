@@ -29,6 +29,7 @@ CHUNK_OVERLAP = 100 # How many tokens to overlap between chunks
 
 # Pinecone metadata configuration
 MAX_METADATA_CONTENT_LENGTH = 35000  # Conservative limit to stay under 40KB metadata limit
+PINECONE_BATCH_SIZE = 50  # Conservative batch size for upserts to avoid 4MB message limit
 
 # --- Argument Parsing ---
 def parse_arguments():
@@ -135,7 +136,7 @@ def get_embeddings(texts: list[str], client: OpenAI, tokenizer, model: str = EMB
     # Process in smaller batches to stay under the 300k token limit
     current_batch = []
     current_token_count = 0
-    max_tokens_per_batch = 200000  # More conservative limit (was 250k)
+    max_tokens_per_batch = 180000  # Even more conservative limit
     batch_count = 0
     
     for i, text in enumerate(texts):
@@ -144,13 +145,20 @@ def get_embeddings(texts: list[str], client: OpenAI, tokenizer, model: str = EMB
         # If adding this text would exceed the limit, process current batch
         if current_token_count + text_tokens > max_tokens_per_batch and current_batch:
             batch_count += 1
-            print(f"    📦 Processing batch {batch_count} with {len(current_batch)} chunks ({current_token_count:,} tokens)")
+            # Double-check actual token count before sending
+            actual_tokens = sum(len(tokenizer.encode(t)) for t in current_batch)
+            print(f"    📦 Processing batch {batch_count} with {len(current_batch)} chunks (counted: {current_token_count:,}, actual: {actual_tokens:,} tokens)")
+            
+            if actual_tokens > 300000:
+                print(f"  └── ❌ Batch too large! Actual tokens ({actual_tokens:,}) exceed 300k limit")
+                return []
+            
             try:
                 response = client.embeddings.create(input=current_batch, model=model)
                 all_embeddings.extend([item.embedding for item in response.data])
             except Exception as e:
                 print(f"  └── ❌ Error generating embeddings for batch {batch_count}: {e}")
-                print(f"      Batch had {len(current_batch)} chunks with {current_token_count:,} tokens")
+                print(f"      Batch had {len(current_batch)} chunks with actual {actual_tokens:,} tokens")
                 return []
             
             # Start new batch
@@ -163,13 +171,19 @@ def get_embeddings(texts: list[str], client: OpenAI, tokenizer, model: str = EMB
     # Process the final batch
     if current_batch:
         batch_count += 1
-        print(f"    📦 Processing final batch {batch_count} with {len(current_batch)} chunks ({current_token_count:,} tokens)")
+        actual_tokens = sum(len(tokenizer.encode(t)) for t in current_batch)
+        print(f"    📦 Processing final batch {batch_count} with {len(current_batch)} chunks (counted: {current_token_count:,}, actual: {actual_tokens:,} tokens)")
+        
+        if actual_tokens > 300000:
+            print(f"  └── ❌ Final batch too large! Actual tokens ({actual_tokens:,}) exceed 300k limit")
+            return []
+        
         try:
             response = client.embeddings.create(input=current_batch, model=model)
             all_embeddings.extend([item.embedding for item in response.data])
         except Exception as e:
             print(f"  └── ❌ Error generating embeddings for final batch {batch_count}: {e}")
-            print(f"      Batch had {len(current_batch)} chunks with {current_token_count:,} tokens")
+            print(f"      Batch had {len(current_batch)} chunks with actual {actual_tokens:,} tokens")
             return []
     
     return all_embeddings
@@ -281,11 +295,16 @@ def main():
             chunks_added = 0
             if vectors_to_upsert:
                 try:
-                    # Upsert in smaller batches if necessary
-                    batch_size = 100 
+                    # Use smaller batches to avoid 4MB message size limit
+                    # Large documents can have huge payloads, so be conservative
+                    batch_size = PINECONE_BATCH_SIZE
+                    print(f"  📤 Upserting {len(vectors_to_upsert)} vectors in batches of {batch_size}")
+                    
                     for j in range(0, len(vectors_to_upsert), batch_size):
                         batch = vectors_to_upsert[j:j + batch_size]
                         index.upsert(vectors=batch)
+                        print(f"    ✅ Upserted batch {j//batch_size + 1}/{(len(vectors_to_upsert)-1)//batch_size + 1}")
+                    
                     chunks_added = len(vectors_to_upsert)
                     total_chunks_created += chunks_added
                     
@@ -295,6 +314,7 @@ def main():
                     
                 except Exception as e:
                     print(f"  └── ❌ Error upserting to Pinecone for {filename}: {e}")
+                    print(f"      Attempted to upsert {len(vectors_to_upsert)} vectors")
             
             pbar.update(1)
 
