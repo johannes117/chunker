@@ -244,13 +244,17 @@ def main():
     
     # Filter out already processed files if resuming
     if args.resume and processed_filenames:
-        remaining_files = [f for f in pdf_files if f not in processed_filenames]
+        if args.recursive:
+            remaining_files = [f for f in pdf_files if os.path.basename(f) not in processed_filenames]
+        else:
+            remaining_files = [f for f in pdf_files if os.path.basename(f) not in processed_filenames]
         print(f"📁 Found {len(pdf_files)} total PDF files")
         print(f"✅ Already processed: {len(processed_filenames)} files")
         print(f"⏳ Remaining to process: {len(remaining_files)} files")
         pdf_files = remaining_files
     else:
-        print(f"Found {len(pdf_files)} PDF files to process. Starting fresh...")
+        folder_desc = "recursively" if args.recursive else "in folder"
+        print(f"Found {len(pdf_files)} PDF files {folder_desc}. Starting fresh...")
     
     if not pdf_files:
         print("🎉 All files already processed!")
@@ -259,11 +263,11 @@ def main():
     total_chunks_created = state["total_chunks"]
 
     with tqdm(total=len(pdf_files), desc="Processing PDFs") as pbar:
-        for filename in pdf_files:
+        for file_path in pdf_files:
+            filename = os.path.basename(file_path)
             pbar.set_postfix_str(filename, refresh=True)
             
             # 1. Extract text
-            file_path = filename
             document_text = get_pdf_text(file_path)
             if not document_text:
                 pbar.update(1)
@@ -294,9 +298,12 @@ def main():
                     if len(chunk) > MAX_METADATA_CONTENT_LENGTH:
                         truncated_content += "..."
                     
+                    # Include relative path for files found recursively
+                    source_path = os.path.relpath(file_path, args.pdf_folder) if args.recursive else filename
+                    
                     metadata = {
                         'content': truncated_content, 
-                        'source': filename,
+                        'source': source_path,
                         'chunk_index': i,
                         'original_length': len(chunk)
                     }
