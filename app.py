@@ -17,6 +17,7 @@ load_dotenv()
 # OpenAI and Pinecone API keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")  # Default index name from environment
 
 # Embedding model configuration
 EMBEDDING_MODEL = "text-embedding-3-large"
@@ -35,10 +36,11 @@ PINECONE_BATCH_SIZE = 50  # Conservative batch size for upserts to avoid 4MB mes
 def parse_arguments():
     """Parses command-line arguments."""
     parser = argparse.ArgumentParser(description="Process PDFs and upload to Pinecone.")
-    parser.add_argument("--index_name", type=str, required=True, help="Name of the Pinecone index.")
+    parser.add_argument("--index_name", type=str, help="Name of the Pinecone index. Overrides PINECONE_INDEX_NAME environment variable if provided.")
     parser.add_argument("--pdf_folder", type=str, required=True, help="Path to the folder containing PDF files.")
     parser.add_argument("--resume", action="store_true", help="Resume from previous state file.")
     parser.add_argument("--state_file", type=str, default="processing_state.json", help="Path to state file for resume functionality.")
+    parser.add_argument("-r", "--recursive", action="store_true", help="Recursively process PDFs in subfolders.")
     return parser.parse_args()
 
 # --- State Management Functions ---
@@ -199,18 +201,23 @@ def main():
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
     pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
     
+    # Determine the index name
+    index_name = args.index_name if args.index_name else PINECONE_INDEX_NAME
+    if not index_name:
+        raise ValueError("Pinecone index name must be provided via --index_name or PINECONE_INDEX_NAME environment variable.")
+
     # Check if the Pinecone index exists and has the correct dimension
     try:
-        index_description = pinecone_client.describe_index(args.index_name)
+        index_description = pinecone_client.describe_index(index_name)
         if index_description.dimension != EMBEDDING_DIMENSION:
-            print(f"❌ Error: Index '{args.index_name}' has dimension {index_description.dimension}, but model '{EMBEDDING_MODEL}' requires {EMBEDDING_DIMENSION}.")
+            print(f"❌ Error: Index '{index_name}' has dimension {index_description.dimension}, but model '{EMBEDDING_MODEL}' requires {EMBEDDING_DIMENSION}.")
             return
     except Exception as e:
-        print(f"❌ Error connecting to or describing index '{args.index_name}': {e}")
+        print(f"❌ Error connecting to or describing index '{index_name}': {e}")
         print("Please ensure the index exists and your API key is correct.")
         return
         
-    index = pinecone_client.Index(args.index_name)
+    index = pinecone_client.Index(index_name)
     tokenizer = tiktoken.get_encoding("cl100k_base") # Tokenizer for text-embedding models
 
     # --- State Management ---
@@ -221,7 +228,15 @@ def main():
     processed_filenames = [item["filename"] for item in state["processed_files"]]
     
     # --- File Processing ---
-    pdf_files = [f for f in os.listdir(args.pdf_folder) if f.lower().endswith('.pdf')]
+    pdf_files = []
+    if args.recursive:
+        for root, dirs, files in os.walk(args.pdf_folder):
+            for file in files:
+                if file.lower().endswith('.pdf'):
+                    pdf_files.append(os.path.join(root, file))
+    else:
+        pdf_files = [f for f in os.listdir(args.pdf_folder) if f.lower().endswith('.pdf')]
+        pdf_files = [os.path.join(args.pdf_folder, f) for f in pdf_files]
     
     if not pdf_files:
         print(f"No PDF files found in '{args.pdf_folder}'.")
@@ -248,7 +263,7 @@ def main():
             pbar.set_postfix_str(filename, refresh=True)
             
             # 1. Extract text
-            file_path = os.path.join(args.pdf_folder, filename)
+            file_path = filename
             document_text = get_pdf_text(file_path)
             if not document_text:
                 pbar.update(1)
